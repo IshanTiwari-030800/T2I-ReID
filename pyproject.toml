@@ -1,0 +1,13 @@
+[project]
+name = "T2I-ReID"
+version = "0.0.1"
+description = "Text-to-Image ReID"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{name = "ishant", email = "ishan.tiwari.it.jsr@gmail.com"}]
+keywords = ['nbdev']
+dependencies = []
+
+[tool.nbdev]
+lib_path = "."
