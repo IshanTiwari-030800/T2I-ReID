@@ -1,0 +1,77 @@
+# Experiment 1: text-guided deformable sampling (spec: experiments/exp1/README.md). Evaluated on the T2I-VeRW 'val'
+# split, which is the split the T2I-VeRW paper reports on (Table IV: IRRA 47.3 R1 / 22.8 mAP; PFCVR 55.2 R1 / 26.2 mAP).
+#
+#   python train.py --config configs/exp1_baseline.yaml [key=value ...]     e.g. optim.epochs=1 wandb.mode=offline
+
+experiment: exp1_baseline
+seed: 1
+device: cuda
+output_dir: /mnt/data/ishant/T2I-ReID/logs/exp1_baseline
+resume: true                      # continue from output_dir/checkpoint_latest.pth when it exists
+
+model:
+  name: clip_vitb_16
+  arch: text_guided_deformable    # text_guided_deformable (Experiment 1) | dual_encoder (plain CLIP, CLS vs EOT)
+  embed_dim: 512
+  # text_guided_deformable only
+  grid_size: 14                   # 224 / 16-px patches
+  num_heads: 8                    # deformable heads (H); also the heads of both cross-attention stacks
+  num_points: 4                   # sampling points per head (P): H*P = 32 points per image query
+  text_depth: 4                   # step 2: text <- image cross-attention blocks
+  spatial_depth: 2                # step 3: spatial tokens <- enriched text cross-attention blocks
+  dropout: 0.0
+  pool: cls_residual              # step 6: cls_residual (g = cls + gamma*mean(D), gamma = 0 at init) | mean (g = mean(D))
+
+data:
+  root: /mnt/data/ishant/datasets/T2I-VeRW
+  ann_file: annotations/reid_with_mask_prompt_and_boxes_filepath_prefixid_idsplit_70_30.json
+  test_split: val
+  image_size: [224, 224]
+  # Experiment 1 scores every caption against every image in the batch (B^2 pairs per step), so memory grows with
+  # B^2. Measured on one MI300X (192 GiB), full train step incl. AdamW (peak allocated / reserved, s/step):
+  #   B=64: 98 / 110 GiB, 1.10 s | B=72: 123 / 138 GiB, 1.35 s | B=80: 150 / 169 GiB, 1.65 s | B=88: OOM
+  # B=80 is the largest that fits: 6400 pairs/step, 128 steps/epoch (drops 24 of 10264), ~3.5 min/epoch.
+  batch_size: 80
+  test_batch_size: 1024
+  num_workers: 16
+  aug:
+    hflip: false                  # captions name sides ("upper left of the windshield"); flipping contradicts them
+    pad_crop: 10                  # pad by this many pixels then random-crop back to image_size; 0 disables
+    random_erasing: 0.5           # probability (scale 0.02-0.4, filled with the mean); 0 disables
+
+loss:
+  temperature: 0.02
+  sdm_weight: 1.0
+  id_weight: 1.0
+
+optim:
+  # Batch-64 recipe (IRRA); square-root scaling to B=80 would be x1.12, so left as is.
+  lr: 1.0e-5                      # CLIP backbone
+  head_lr: 1.0e-4                 # newly initialised modules
+  weight_decay: 4.0e-5            # not applied to biases, norms or other 1-D params
+  betas: [0.9, 0.999]
+  grad_clip: 1.0                  # max total grad norm; null disables clipping (the norm is still logged)
+  epochs: 200                     # x 128 steps = 25600 optimiser steps, ~11.7 h of training at 1.65 s/step
+  warmup_epochs: 10               # 1280 steps (5% of training), linear from warmup_factor * lr
+  warmup_factor: 0.1              # then cosine annealing from lr to 0 over the remaining 190 epochs
+  amp: bf16                       # bf16 | none
+
+log:
+  every: 10                       # train metrics are averaged over, and logged every, this many steps
+  eval_every: 20                  # epochs (+ the last). Full pairwise eval = 19.4M pairs, ~20 min (extrapolated from 500 queries) -> 10 evals ~3.5 h
+  # Off: at step 0 gamma = 0, so the pairwise ranking equals zero-shot CLIP, already measured on this split
+  # (R1 3.11 / R5 8.42 / R10 13.10 / mAP 2.71 / mINP 0.74); a pairwise eval would spend ~20 min to reproduce it.
+  eval_at_start: false
+  max_iters_per_epoch: null       # set for smoke tests
+  # Pairwise eval: (caption, image) pairs scored per forward. Measured on 500 queries x 4404 images: 8192 -> 169 s,
+  # 33 GiB; 16384 -> 163 s, 62 GiB; 32768 -> 162 s, 119 GiB (compute-bound). 8192 keeps eval's memory small next to
+  # what training holds.
+  eval_pairs_per_chunk: 8192
+  eval_max_queries: null          # smoke tests only: evaluate the first N queries (metrics not comparable)
+
+wandb:
+  enabled: true
+  project: t2i-reid
+  name: null                      # null: the basename of output_dir
+  tags: [exp1, baseline, clip_vitb_16]
+  mode: online                    # online | offline | disabled

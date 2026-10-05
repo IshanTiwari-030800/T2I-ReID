@@ -7,7 +7,6 @@ __all__ = ['CLIP_MEAN', 'CLIP_STD', 'T2IReIDDataset', 'T2IVeRW', 'ImageTextDatas
 # %% ../nbs/02_data.ipynb #35d908ae
 import json
 from pathlib import Path
-
 import torchvision.transforms as T
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -105,6 +104,7 @@ def _tokenize(caption, tokenizer):
 # %% ../nbs/02_data.ipynb #031562cf
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
 
 def build_transform(size=(224, 224), mean=CLIP_MEAN, std=CLIP_STD):
     return T.Compose([T.Resize(size, interpolation=T.InterpolationMode.BICUBIC), T.ToTensor(), T.Normalize(mean, std)])

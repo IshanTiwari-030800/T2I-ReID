@@ -11,3 +11,12 @@ dependencies = []
 
 [tool.nbdev]
 lib_path = "."
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+# The repo root is the library (nbdev lib_path = "."); install it under the importable name `t2i_reid`.
+[tool.setuptools]
+package-dir = {"t2i_reid" = "."}
+packages = ["t2i_reid", "t2i_reid.data", "t2i_reid.model", "t2i_reid.loss", "t2i_reid.utils"]
