@@ -1,0 +1,78 @@
+# Experiment 2: text-conditioned patch queries (spec: experiments/exp2/README.md). Each CLIP patch token
+# cross-attends to the caption tokens and predicts its own deformable sampling offsets. Same data, losses, evaluation
+# and optimiser as Experiment 1 (configs/exp1_baseline.yaml); differences are marked "Exp1:".
+# The control (branch exp2-control-no-text) is this config with model.text_conditioning=false.
+#
+#   python train.py --config configs/exp2_patch_query.yaml [key=value ...]
+
+experiment: exp2_patch_query
+seed: 1
+device: cuda
+output_dir: /mnt/data/ishant/T2I-ReID/logs/exp2_patch_query
+resume: true                      # continue from output_dir/checkpoint_latest.pth when it exists
+
+model:
+  name: clip_vitb_16
+  arch: patch_query_deformable    # Exp1: text_guided_deformable
+  embed_dim: 512
+  grid_size: 14                   # 224 / 16-px patches
+  num_heads: 8                    # deformable heads (H); also the heads of the cross-attention stack
+  num_points: 16                  # sampling points per head (P): H*P = 128 per patch query. Exp1: 4 (32 per query)
+  init_radius: 4.0                # initial points evenly spaced out to 4 patches along each head's direction
+  depth: 4                        # patch <- caption cross-attention blocks. Exp1: 4 text <- image + 2 spatial <- text
+  text_conditioning: true         # false = control: the caption is replaced by one learned token
+  dropout: 0.0
+  # Training scores all B^2 pairs; steps 2-7 then hold ~33 MB of activations per pair (B=80: ~210 GB). Score them in
+  # chunks of this many under activation checkpointing (same loss and gradients, checked); 0 = off.
+  checkpoint_pairs: 1600
+  # Bilinear sampling as dense matmuls on the 14x14 map; equal to grid_sample (checked), whose backward scatters
+  # 128 points x 196 queries per pair with atomic adds. Measured B=32, no checkpointing: 0.36 vs 1.28 s/step.
+  deform_impl: dense
+  pool: cls_residual              # g = cls + gamma * mean(D), gamma = 0 at init
+
+data:
+  root: /mnt/data/ishant/datasets/T2I-VeRW
+  ann_file: annotations/reid_with_mask_prompt_and_boxes_filepath_prefixid_idsplit_70_30.json
+  test_split: val
+  image_size: [224, 224]
+  # Measured on one MI300X (peak allocated / reserved, s/step), dense sampling:
+  #   B=64, no checkpointing: 138 / 162 GiB, 1.10 s | B=80, chunks of 1600: 60 / 69 GiB, 2.08 s (4.4 min/epoch)
+  #   B=80, chunks of 3200: 110 / 127 GiB, 2.04 s.  B=80 matches Exp1 and leaves room on a GPU other jobs share.
+  batch_size: 80
+  test_batch_size: 1024
+  num_workers: 16
+  aug:
+    hflip: false                  # captions name sides ("upper left of the windshield"); flipping contradicts them
+    pad_crop: 10
+    random_erasing: 0.5
+
+loss:
+  temperature: 0.02
+  sdm_weight: 1.0
+  id_weight: 1.0
+
+optim:
+  lr: 1.0e-5                      # CLIP backbone
+  head_lr: 1.0e-4                 # newly initialised modules
+  weight_decay: 4.0e-5            # not applied to biases, norms or learned tokens
+  betas: [0.9, 0.999]
+  grad_clip: 1.0
+  epochs: 100                     # Exp1: 200 (its best eval was at epoch 80, then it overfit)
+  warmup_epochs: 5                # 5% of training, as in Exp1; linear from warmup_factor * lr
+  warmup_factor: 0.1              # then cosine annealing from lr to 0
+  amp: bf16
+
+log:
+  every: 10
+  eval_every: 10                  # epochs (+ the last). Exp1: 20. 10 evals x ~25 min = ~4 h; total run ~11.5 h
+  eval_at_start: false            # at gamma = 0 the ranking is zero-shot CLIP: R1 3.11 / mAP 2.71 on this split
+  max_iters_per_epoch: null
+  eval_pairs_per_chunk: 4096      # full pairwise eval (19.4M pairs) ~24.5 min, 38 GiB (measured on 500 queries)
+  eval_max_queries: null
+
+wandb:
+  enabled: true
+  project: t2i-reid
+  name: null                      # null: the basename of output_dir
+  tags: [exp2, patch_query, text_conditioned, clip_vitb_16]
+  mode: online

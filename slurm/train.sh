@@ -14,12 +14,15 @@
 #
 # Training resumes from <output_dir>/checkpoint_latest.pth when it exists (resume=true in the config), so the
 # same command can be resubmitted after a crash or timeout.
+#
+# The code that runs is the checkout sbatch is called from (each experiment branch has its own git worktree), not
+# the editable install of t2i_reid, which points at /mnt/data/ishant/T2I-ReID.
 # =============================================================================
 
 set -euo pipefail
 
 CONFIG="$1"; shift
-PROJECT_DIR="/mnt/data/ishant/T2I-ReID"
+PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-/mnt/data/ishant/T2I-ReID}}"
 
 export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
 
@@ -51,6 +54,11 @@ source "/apps/software/anaconda3/etc/profile.d/conda.sh"
 conda activate TransReID
 cd "$PROJECT_DIR"
 
+# Import t2i_reid from PROJECT_DIR: a directory on PYTHONPATH wins over the editable-install finder.
+SHIM="$(mktemp -d)"; trap 'rm -rf "$SHIM"' EXIT
+ln -s "$PROJECT_DIR" "$SHIM/t2i_reid"
+export PYTHONPATH="$SHIM${PYTHONPATH:+:$PYTHONPATH}"
+
 export ROCR_VISIBLE_DEVICES="${GPU_UUIDS[$PIN_GPU]}"
 export HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0 GPU_DEVICE_ORDINAL=0
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
@@ -60,8 +68,10 @@ echo "Job ID:  ${SLURM_JOB_ID:-none}"
 echo "Config:  $CONFIG $*"
 echo "Node:    $(hostname)"
 echo "Date:    $(date)"
+echo "Code:    $PROJECT_DIR ($(git rev-parse --abbrev-ref HEAD))"
 echo "Commit:  $(git rev-parse --short HEAD)$(git diff --quiet HEAD -- . || echo ' (dirty)')"
 echo "GPU:     physical $PIN_GPU ($ROCR_VISIBLE_DEVICES); Slurm slots ${JOB_GPUS:-?}"
+python -c "import t2i_reid, os; assert os.path.realpath(t2i_reid.__path__[0]) == os.path.realpath('$PROJECT_DIR'), t2i_reid.__path__"
 python -c "import torch; assert torch.cuda.device_count() == 1, torch.cuda.device_count(); print('GPU:', torch.cuda.get_device_name(0))"
 echo "============================================"
 

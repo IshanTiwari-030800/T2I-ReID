@@ -14,12 +14,13 @@
 
 set -uo pipefail
 CONFIG="$1"
-OUT=/mnt/data/ishant/T2I-ReID/logs/smoke
+export PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-/mnt/data/ishant/T2I-ReID}}"
+OUT=/mnt/data/ishant/T2I-ReID/logs/smoke_${SLURM_JOB_ID:-local}
 rm -rf "$OUT"
 Q="log.max_iters_per_epoch=30 log.every=10 log.eval_every=1 log.eval_max_queries=200 wandb.mode=offline output_dir=$OUT"
 
-bash /mnt/data/ishant/T2I-ReID/slurm/train.sh "$CONFIG" $Q optim.epochs=2 resume=false || exit 1
-bash /mnt/data/ishant/T2I-ReID/slurm/train.sh "$CONFIG" $Q optim.epochs=3 resume=true || exit 1
+bash "$PROJECT_DIR/slurm/train.sh" "$CONFIG" $Q optim.epochs=2 resume=false || exit 1
+bash "$PROJECT_DIR/slurm/train.sh" "$CONFIG" $Q optim.epochs=3 resume=true || exit 1
 grep -q "Resumed from" "$OUT/train_log.txt" || { echo "resume did not happen"; exit 1; }
 rm -f "$OUT"/*.pth
 echo "SMOKE OK"

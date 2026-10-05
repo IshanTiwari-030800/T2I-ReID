@@ -6,3 +6,4 @@ from .models import (
 )
 from .dual_encoder import DualEncoder
 from .text_guided import DeformableAttention, TextGuidedDeformable
+from .patch_query import PatchQueryOffsets, PatchQueryDeformable

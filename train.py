@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader
 from t2i_reid.data import T2IVeRW, ImageTextDataset, ImageDataset, TextDataset, build_transform
 from t2i_reid.data.dataset import CLIP_MEAN, CLIP_STD
 from t2i_reid.loss import sdm_loss_from_sim, id_loss
-from t2i_reid.model import make_model, DualEncoder, TextGuidedDeformable
+from t2i_reid.model import make_model, DualEncoder, TextGuidedDeformable, PatchQueryDeformable
 from t2i_reid.utils import t2i_metrics
 
 CKPT_NAME = 'checkpoint_latest.pth'
@@ -95,7 +95,8 @@ def build_loaders(cfg, dataset):
 
 def build_model(cfg, num_classes):
 
-    """cfg.model.arch: 'text_guided_deformable' (Experiment 1) or 'dual_encoder' (plain CLIP, CLS vs EOT)."""
+    """cfg.model.arch: 'text_guided_deformable' (Experiment 1), 'patch_query_deformable' (Experiment 2 and its
+    control, model.text_conditioning) or 'dual_encoder' (plain CLIP, CLS vs EOT)."""
 
     clip_model, _ = make_model(cfg)
     m = cfg.model
@@ -105,20 +106,27 @@ def build_model(cfg, num_classes):
         return TextGuidedDeformable(clip_model, num_classes, embed_dim=m.embed_dim, grid_size=m.grid_size,
                                     num_heads=m.num_heads, num_points=m.num_points, text_depth=m.text_depth,
                                     spatial_depth=m.spatial_depth, dropout=m.dropout, pool=m.pool)
+    if m.arch == 'patch_query_deformable':
+        model = PatchQueryDeformable(clip_model, num_classes, embed_dim=m.embed_dim, grid_size=m.grid_size,
+                                     num_heads=m.num_heads, num_points=m.num_points, depth=m.depth, dropout=m.dropout,
+                                     pool=m.pool, text_conditioning=m.text_conditioning, init_radius=m.init_radius,
+                                     deform_impl=m.get('deform_impl', 'dense'))
+        model.checkpoint_pairs = m.get('checkpoint_pairs', 0) or 0
+        return model
     raise ValueError(f'unknown model.arch {m.arch!r}')
 
 
 def build_optimizer(cfg, model):
 
     """AdamW with two LR groups (CLIP backbone vs new modules); no weight decay on 1-D params (biases, norms, ...)
-    or on the learned spatial tokens."""
+    or on learned tokens (Experiment 1's spatial tokens, the control's null caption token)."""
 
     groups = defaultdict(list)
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         lr_key = 'backbone' if name.startswith('clip.') else 'head'
-        decay_key = 'no_decay' if param.ndim <= 1 or 'spatial_tokens' in name else 'decay'
+        decay_key = 'no_decay' if param.ndim <= 1 or 'spatial_tokens' in name or 'null_context' in name else 'decay'
         groups[(lr_key, decay_key)].append(param)
     lrs = {'backbone': cfg.optim.lr, 'head': cfg.optim.head_lr}
     param_groups = [{'params': params, 'name': f'{lr_key}/{decay_key}', 'lr': lrs[lr_key],
@@ -221,22 +229,34 @@ def evaluate_pairwise(model, query_loader, gallery_loader, device, autocast, pai
 @torch.no_grad()
 def evaluate_dual(model, query_loader, gallery_loader, device, autocast):
 
-    """Embed every query caption and gallery image once, rank the gallery for each query by cosine similarity."""
+    """Embed every query caption and gallery image once, rank the gallery for each query by cosine similarity.
+
+    Models with a deformable branch but no caption dependence (Experiment 2 control) provide embed_image /
+    embed_text; their embed_image also returns the CLIP CLS, reported as dual_* (the backbone alone, CLS vs EOT).
+    """
 
     model.eval()
-    embed = lambda fn, x: F.normalize(fn(x.to(device, non_blocking=True)).float(), dim=-1)
-    q_feats, q_pids, g_feats, g_pids = [], [], [], []
+    embed_image = getattr(model, 'embed_image', model.encode_image)
+    embed_text = getattr(model, 'embed_text', model.encode_text)
+    q_feats, q_pids, g_feats, g_cls, g_pids = [], [], [], [], []
 
     with autocast():
         for batch in query_loader:
-            q_feats.append(embed(model.encode_text, batch['caption']))
+            q_feats.append(embed_text(batch['caption'].to(device, non_blocking=True)).float())
             q_pids.append(batch['pid'])
         for batch in gallery_loader:
-            g_feats.append(embed(model.encode_image, batch['image']))
+            feats = embed_image(batch['image'].to(device, non_blocking=True))
+            feats = feats if isinstance(feats, tuple) else (feats,)
+            g_feats.append(feats[0].float())
+            g_cls.extend(feats[1:])
             g_pids.append(batch['pid'])
 
-    sim = torch.cat(q_feats) @ torch.cat(g_feats).t()                                       # [Q, G]
-    metrics = t2i_metrics(sim, torch.cat(q_pids).to(device), torch.cat(g_pids).to(device))
+    q_pids, g_pids = torch.cat(q_pids).to(device), torch.cat(g_pids).to(device)
+    q = F.normalize(torch.cat(q_feats), dim=-1)
+    metrics = t2i_metrics(q @ F.normalize(torch.cat(g_feats), dim=-1).t(), q_pids, g_pids)  # [Q, G]
+    if g_cls:
+        dual = q @ F.normalize(torch.cat(g_cls).float(), dim=-1).t()
+        metrics.update({f'dual_{k}': v for k, v in t2i_metrics(dual, q_pids, g_pids).items()})
     model.train()
 
     return metrics
@@ -262,9 +282,13 @@ def offset_stats(model, locations):
 
     grid = model.offsets.grid_size
     loc = locations.float()
-    ref = model.offsets.spatial_tokens.reference_points[None, None, :, None, None]
-    stats = {'offset_disp': ((loc - ref) * grid).norm(dim=-1).mean().item(),
-             'offset_text_std': (loc.std(dim=0) * grid).norm(dim=-1).mean().item()}
+    ref = getattr(model.offsets, 'reference_points', None)
+    if ref is None:
+        ref = model.offsets.spatial_tokens.reference_points
+    ref = ref[None, None, :, None, None]
+    # A caption-independent model passes one set of locations per image ([1, B, ...]): no spread across captions.
+    text_std = (loc.std(dim=0) * grid).norm(dim=-1).mean().item() if loc.shape[0] > 1 else 0.0
+    stats = {'offset_disp': ((loc - ref) * grid).norm(dim=-1).mean().item(), 'offset_text_std': text_std}
     if getattr(model, 'gamma', None) is not None:
         stats['gamma'] = model.gamma.item()
     return stats
